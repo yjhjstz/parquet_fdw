@@ -5,6 +5,7 @@
 #include "arrow/api.h"
 #include "arrow/io/api.h"
 #include "arrow/array.h"
+#include "arrow/util/bit-util.h"
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/schema.h"
 #include "parquet/exception.h"
@@ -1180,6 +1181,7 @@ read_next_batch(ForeignScanState *node)
     for (int attr = 0; attr < slot->tts_tupleDescriptor->natts; attr++)
     {
         int arrow_col = festate->map[attr];
+
         /*
          * We only fill slot attributes if column was referred in targetlist
          * or clauses. In other cases mark attribute as NULL.
@@ -1195,6 +1197,23 @@ read_next_batch(ForeignScanState *node)
             int                 arrow_type_id = arrow_type->id();
             MemoryContext       oldcxt;
 
+            /*
+             * Dirty hack to make check for null faster. The problem with
+             * arrow's IsNull() function is that it accesses shared_ptr and it
+             * becomes time consuming when we need to access it millions of
+             * times. To mitigate this we get direct pointer to the array's
+             * `data` member and have our own lambda function doing the same
+             * on it as IsNull(). We should be carefull though in case if
+             * `libarrow` developers decide to change their implementation.
+             */
+            auto array_data = array->data().get();
+            auto null_bitmap_data = array->null_bitmap_data();
+            auto is_null = [&null_bitmap_data, &array_data](int64 i) {
+                return null_bitmap_data != NULLPTR &&
+                    !arrow::BitUtil::GetBit(null_bitmap_data,
+                                            i + array_data->offset);
+            };
+
             festate->batch_offset = festate->row;
 
             /* Currently only primitive types and lists are supported */
@@ -1208,7 +1227,7 @@ read_next_batch(ForeignScanState *node)
                      i < festate->batch_capacity && row < festate->num_rows;
                      i++, row++)
                 {
-                    if (festate->has_nulls[arrow_col] && array->IsNull(row))
+                    if (festate->has_nulls[arrow_col] && is_null(row))
                     {
                         festate->nulls[arrow_col][i] = true;
                         continue;
@@ -1248,7 +1267,7 @@ read_next_batch(ForeignScanState *node)
                 {
                     arrow::ListArray   *larray = (arrow::ListArray *) array;
 
-                    if (festate->has_nulls[arrow_col] && array->IsNull(row))
+                    if (festate->has_nulls[arrow_col] && is_null(row))
                     {
                         festate->nulls[arrow_col][i] = true;
                         continue;
