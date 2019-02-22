@@ -1,5 +1,5 @@
 MODULE_big = parquet_fdw
-OBJS = parquet.o parquet_fdw.o 
+OBJS = parquet.o parquet_fdw.o arrow_bytea.o
 PGFILEDESC = "parquet_fdw - foreign data wrapper for parquet"
 
 SHLIB_LINK = -lm -lstdc++ -lparquet -larrow

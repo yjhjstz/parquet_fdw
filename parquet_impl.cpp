@@ -21,6 +21,7 @@ extern "C"
 #include "access/sysattr.h"
 #include "access/nbtree.h"
 #include "catalog/pg_type.h"
+#include "catalog/namespace.h"
 #include "commands/defrem.h"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
@@ -41,6 +42,8 @@ extern "C"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+
+#include "arrow_bytea.h"
 }
 
 #define DEFAULT_BATCH_CAPACITY 10000
@@ -132,6 +135,8 @@ public:
      */
     std::list<RowGroupFilter>       filters;
 
+    Oid                             arrow_bytea_oid;
+
     /* Wether object is properly initialized */
     bool     initialized;
 
@@ -200,6 +205,11 @@ create_parquet_state(ForeignScanState *scanstate,
     }
 
     festate->has_nulls = (bool *) palloc(sizeof(bool) * festate->map.size());
+
+    /* TODO: will not work if type is in different schema */
+    festate->arrow_bytea_oid = TypenameGetTypid("arrow_bytea");
+    if (!OidIsValid(festate->arrow_bytea_oid))
+        elog(ERROR, "arrow_bytea type not found");
 
     return festate;
 }
@@ -569,7 +579,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 }
 
 static Oid
-to_postgres_type(int arrow_type)
+to_postgres_type(ParquetFdwExecutionState *festate, int arrow_type)
 {
     switch (arrow_type)
     {
@@ -579,10 +589,15 @@ to_postgres_type(int arrow_type)
             return INT4OID;
         case arrow::Type::INT64:
             return INT8OID;
+        /*
         case arrow::Type::STRING:
             return TEXTOID;
         case arrow::Type::BINARY:
             return BYTEAOID;
+        */
+        case arrow::Type::STRING:
+        case arrow::Type::BINARY:
+            return festate->arrow_bytea_oid;
         case arrow::Type::TIMESTAMP:
             return TIMESTAMPOID;
         case arrow::Type::DATE32:
@@ -641,7 +656,7 @@ initialize_castfuncs(ForeignScanState *node)
         if (src_is_list)
             type_id = get_arrow_list_elem_type(type);
 
-        src_type = to_postgres_type(type_id);
+        src_type = to_postgres_type(festate, type_id);
         dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
 
         if (!OidIsValid(src_type))
@@ -744,11 +759,17 @@ read_primitive_type(arrow::Array *array,
 
             int32_t vallen = 0;
             const char *value = reinterpret_cast<const char*>(binarray->GetValue(i, &vallen));
+            MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+            arrow_bytea *ab = make_arrow_bytea(value, vallen);
+            MemoryContextSwitchTo(oldctx);
 
+            res = PointerGetDatum(ab);
+#if 0
             /* Build bytea */
             bytea *b = cstring_to_text_with_len(value, vallen);
 
             res = PointerGetDatum(b);
+#endif
             break;
         }
         case arrow::Type::TIMESTAMP:
@@ -1016,7 +1037,9 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
             return Int64GetDatum(*(int64 *) bytes);
         case arrow::Type::STRING:
         case arrow::Type::BINARY:
-            return CStringGetTextDatum(bytes);
+            /* TODO is it ok to use strlen? */
+            return (Datum) make_arrow_bytea(bytes, strlen(bytes));
+            //return CStringGetTextDatum(bytes);
         case arrow::Type::TIMESTAMP:
             {
                 TimestampTz ts;
@@ -1058,7 +1081,8 @@ find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
  *      Check if min/max values of the column of the row group match filter.
  */
 static bool
-row_group_matches_filter(parquet::RowGroupStatistics *stats,
+row_group_matches_filter(ParquetFdwExecutionState *festate,
+                         parquet::RowGroupStatistics *stats,
                          arrow::DataType *arrow_type,
                          RowGroupFilter *filter)
 {
@@ -1069,7 +1093,7 @@ row_group_matches_filter(parquet::RowGroupStatistics *stats,
 
     find_cmp_func(&finfo,
                   filter->value->consttype,
-                  to_postgres_type(arrow_type->id()));
+                  to_postgres_type(festate, arrow_type->id()));
 
     switch (filter->strategy)
     {
@@ -1179,7 +1203,7 @@ next_rowgroup:
         stats = rowgroup->ColumnChunk(parquet_col)->statistics();
         type = schema->field(parquet_col)->type();
 
-        if (stats && !row_group_matches_filter(stats.get(), type.get(), &filter))
+        if (stats && !row_group_matches_filter(festate, stats.get(), type.get(), &filter))
         {
             elog(DEBUG1, "parquet_fdw: skip rowgroup %d", festate->row_group);
             festate->row_group++;
