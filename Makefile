@@ -3,6 +3,7 @@ OBJS = parquet.o parquet_fdw.o
 PGFILEDESC = "parquet_fdw - foreign data wrapper for parquet"
 
 SHLIB_LINK = -lm -lstdc++ -lparquet -larrow
+PG_CXXFLAGS += -std=c++11 -O3
 
 EXTENSION = parquet_fdw
 DATA = parquet_fdw--0.1.sql
@@ -19,4 +20,4 @@ parquet.bc:
 	$(COMPILE.cxx.bc) $(CCFLAGS) $(CPPFLAGS) -fPIC -c -o $@ parquet_impl.cpp
 
 parquet.o:
-	$(CXX) -std=c++11 -O3 $(CPPFLAGS) $(CCFLAGS) parquet_impl.cpp $(PG_LIBS) -c -fPIC $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(PG_CXXFLAGS) parquet_impl.cpp $(PG_LIBS) -c -fPIC $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
