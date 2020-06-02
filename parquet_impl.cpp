@@ -18,7 +18,8 @@
 
 //#include "parquet/schema.h"
 #include "parquet/stream_reader.h"
-#include "parquet/stream_writer.h"
+//#include "parquet/stream_writer.h"
+#include "stream_writer.h"
 
 extern "C"
 {
@@ -210,7 +211,7 @@ public:
 
     std::shared_ptr<parquet::schema::GroupNode> schema;
 
-    std::shared_ptr<parquet::StreamWriter> stream_writer;
+    std::shared_ptr<parquet::StreamWriter2> stream_writer;
 
     /* Arrow column indices that are used in query */
     std::vector<int>                indices;
@@ -2293,7 +2294,7 @@ create_insert_state(const char *filename,
     
     builder.compression(parquet::Compression::SNAPPY);
 
-    festate->stream_writer = std::shared_ptr<parquet::StreamWriter>(new parquet::StreamWriter(\
+    festate->stream_writer = std::shared_ptr<parquet::StreamWriter2>(new parquet::StreamWriter2(\
         parquet::ParquetFileWriter::Open(festate->parquet_file, festate->schema, props)));
     festate->stream_writer->SetMaxRowGroupSize(1000);
 
@@ -2454,10 +2455,10 @@ parquetExecForeignInsert(EState *estate,
             }
             else if (attr->attlen == -1)
             { 
-                
+                //todo
                 size_t     vl_len = VARSIZE_ANY_EXHDR(datum);
                 char   *vl_ptr = VARDATA_ANY(datum);
-                *os << parquet::StreamWriter::FixedStringView{vl_ptr, vl_len};
+                *os << parquet::StreamWriter2::FixedStringView{vl_ptr, vl_len};
             }
             else
             {
