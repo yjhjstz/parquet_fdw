@@ -60,6 +60,31 @@ extern void parquetInitializeWorkerForeignScan(ForeignScanState *node,
 extern void parquetShutdownForeignScan(ForeignScanState *node);
 extern List *parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid);
 
+/* for insert  */
+extern List *parquetPlanForeignModify(PlannerInfo *root,
+        ModifyTable *plan,
+        Index resultRelation,
+        int subplan_index);
+extern void parquetBeginForeignModify(ModifyTableState *mtstate,
+        ResultRelInfo *resultRelInfo,
+        List *fdw_private,
+        int subplan_index,
+        int eflags);
+extern void parquetBeginForeignInsert(ModifyTableState *mtstate,
+        ResultRelInfo *resultRelInfo);
+extern TupleTableSlot *parquetExecForeignInsert(EState *estate,
+        ResultRelInfo *resultRelInfo,
+        TupleTableSlot *slot,
+        TupleTableSlot *planSlot);
+extern void parquetEndForeignInsert(EState *estate,
+            ResultRelInfo *rrinfo);
+
+extern void parquetExplainForeignModify(ModifyTableState *mtstate,
+              ResultRelInfo *rinfo,
+              List *fdw_private,
+              int subplan_index,
+              struct ExplainState *es);
+
 /* GUC variable */
 extern bool parquet_fdw_use_threads;
 
@@ -101,6 +126,15 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->InitializeWorkerForeignScan = parquetInitializeWorkerForeignScan;
     fdwroutine->ShutdownForeignScan = parquetShutdownForeignScan;
     fdwroutine->ImportForeignSchema = parquetImportForeignSchema;
+
+    /* INSERT/DELETE support */
+    fdwroutine->PlanForeignModify      = parquetPlanForeignModify;
+    fdwroutine->BeginForeignModify     = parquetBeginForeignModify;
+    fdwroutine->BeginForeignInsert     = parquetBeginForeignInsert;
+    fdwroutine->ExecForeignInsert      = parquetExecForeignInsert;
+    //fdwroutine->EndForeignModify       = parquetEndForeignModify;
+    fdwroutine->EndForeignInsert       = parquetEndForeignInsert;
+    fdwroutine->ExplainForeignModify   = parquetExplainForeignModify;
 
     PG_RETURN_POINTER(fdwroutine);
 }

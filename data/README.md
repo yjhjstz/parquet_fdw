@@ -17,5 +17,5 @@ Generator script requires `pyarrow` and `pandas` python modules installed. To
 generate Parquet file run:
 
 ```
-python generate.py
+python3 generate.py
 ```

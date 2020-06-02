@@ -4,6 +4,8 @@
 
 #include <list>
 #include <set>
+#include <utility>
+#include <iostream>
 
 #include "arrow/api.h"
 #include "arrow/io/api.h"
@@ -13,6 +15,10 @@
 #include "parquet/exception.h"
 #include "parquet/file_reader.h"
 #include "parquet/statistics.h"
+
+//#include "parquet/schema.h"
+#include "parquet/stream_reader.h"
+#include "parquet/stream_writer.h"
 
 extern "C"
 {
@@ -196,6 +202,83 @@ public:
     }
 };
 
+
+class ParquetInsertState
+{
+public:
+    std::shared_ptr<::arrow::io::FileOutputStream>  parquet_file;
+
+    std::shared_ptr<parquet::schema::GroupNode> schema;
+
+    std::shared_ptr<parquet::StreamWriter> stream_writer;
+
+    /* Arrow column indices that are used in query */
+    std::vector<int>                indices;
+
+    /*
+     * Mapping between slot attributes and arrow result set columns.
+     * Corresponds to 'indices' vector.
+     */
+    std::vector<int>                map;
+
+    /*
+     * Cast functions from dafult postgres type defined in `to_postgres_type`
+     * to actual table column type.
+     */
+    std::vector<FmgrInfo *>         castfuncs;
+
+    /* Current row group */
+    std::shared_ptr<arrow::Table>   table;
+
+    /*
+     * Plain pointers to inner the structures of row group. It's needed to
+     * prevent excessive shared_ptr management.
+     */
+    std::vector<arrow::Array *>     chunks;
+    std::vector<arrow::DataType *>  types;
+
+    bool           *has_nulls;          /* per-column info on nulls */
+
+    int             row_group;          /* current row group index */
+    uint32_t        row;                /* current row within row group */
+    uint32_t        num_rows;           /* total rows in row group */
+    std::vector<ChunkInfo> chunk_info;  /* current chunk and position per-column */
+
+    /*
+     * Filters built from query restrictions that help to filter out row
+     * groups.
+     */
+    std::list<RowGroupFilter>       filters;
+
+    /*
+     * List of row group indexes to scan
+     */
+    std::vector<int>                rowgroups;
+
+    /*
+     * Special memory segment to speed up bytea/Text allocations.
+     */
+    MemoryContext                   memcxt;
+   
+    /* Callback to delete this state object in case of ERROR */
+    MemoryContextCallback           callback;
+    bool                            autodestroy;
+
+    /* Coordinator for parallel query execution */
+    ParallelCoordinator            *coordinator;
+
+    /* Wether object is properly initialized */
+    bool     initialized;
+
+    ParquetInsertState(const char *filename)
+        : parquet_file(::arrow::io::FileOutputStream::Open(filename).ValueOrDie()),
+          row_group(-1), row(0), num_rows(0), coordinator(NULL),
+          initialized(false)
+    {
+        
+    }
+};
+
 static void
 destroy_parquet_state(void *arg)
 {
@@ -221,6 +304,9 @@ create_parquet_state(const char *filename,
 
     if (!parquet::arrow::FromParquetSchema(schema, props, &festate->schema).ok())
         elog(ERROR, "parquet_fdw: error reading parquet schema");
+
+
+    parquet::schema::PrintSchema(schema->schema_root().get(), std::cout);
 
     /* Enable parallel columns decoding/decompression if needed */
     festate->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
@@ -249,6 +335,7 @@ create_parquet_state(const char *filename,
              * XXX If we will ever want to support structs then this should be
              * changed.
              */
+            elog(INFO, "dot path %s .", path[0].c_str());
             if (strcmp(NameStr(TupleDescAttr(tupleDesc, i)->attname),
                        path[0].c_str()) == 0)
             {
@@ -285,6 +372,8 @@ create_parquet_state(const char *filename,
 
     return festate;
 }
+
+
 
 /*
  * C interface functions
@@ -1279,6 +1368,21 @@ nested_list_get_datum(ParquetFdwExecutionState *festate,
         copy_to_c_array<int64_t>((int64_t *) values, array, elem_len);
         goto construct_array;
     }
+    /* Fill values and nulls arrays */
+    if (array->null_count() == 0 && type_id == arrow::Type::FLOAT)
+    {
+        /*
+         * Ok, there are no nulls, so probably we could just memcpy the
+         * entire array.
+         *
+         * Warning: the code below is based on the assumption that Datum is
+         * 8 bytes long, which is true for most contemporary systems but this
+         * will not work on some exotic or really old systems. In this case
+         * the entire "if" branch should just be removed.
+         */
+        copy_to_c_array<float>((float *) values, array, elem_len);
+        goto construct_array;
+    }
     for (int64_t i = 0; i < array->length(); ++i)
     {
         if (!array->IsNull(i))
@@ -2071,4 +2175,319 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
     FreeDir(d);
 
     return cmds;
+}
+
+extern "C" List *
+parquetPlanForeignModify(PlannerInfo *root,
+                       ModifyTable *plan,
+                       Index resultRelation,
+                       int subplan_index)
+{
+    elog(INFO,"foreign parquetPlanForeignModify");   
+    if (plan->operation != CMD_INSERT)
+        elog(ERROR, "not a supported operation on arrow_fdw foreign tables");
+
+    return NIL;
+}
+
+
+extern "C" void
+parquetExplainForeignModify(ModifyTableState *mtstate,
+                          ResultRelInfo *rinfo,
+                          List *fdw_private,
+                          int subplan_index,
+                          struct ExplainState *es)
+{
+    /* print something */
+}
+
+
+static std::pair<parquet::Type::type, parquet::ConvertedType::type>
+to_parquet_type(int oid)
+{
+    // todo (yang)
+    switch (oid)
+    {
+        case BOOLOID:
+            return std::make_pair(parquet::Type::BOOLEAN, parquet::ConvertedType::NONE);
+        case INT4OID:
+        case INT4ARRAYOID:
+            return std::make_pair(parquet::Type::INT32, parquet::ConvertedType::INT_32);
+        case INT8OID:
+        case INT8ARRAYOID:
+            return std::make_pair(parquet::Type::INT64, parquet::ConvertedType::INT_64);
+        case FLOAT4OID:
+        case FLOAT4ARRAYOID:
+            return std::make_pair(parquet::Type::FLOAT, parquet::ConvertedType::NONE);
+        case FLOAT8OID:
+            return std::make_pair(parquet::Type::DOUBLE, parquet::ConvertedType::NONE);
+        case BYTEAOID:
+            return std::make_pair(parquet::Type::BYTE_ARRAY, parquet::ConvertedType::NONE);
+        case TEXTOID:
+            return std::make_pair(parquet::Type::BYTE_ARRAY, parquet::ConvertedType::UTF8);
+        case TIMESTAMPOID:
+            return std::make_pair(parquet::Type::INT64, parquet::ConvertedType::TIMESTAMP_MICROS);
+        case DATEOID:
+            return std::make_pair(parquet::Type::INT32, parquet::ConvertedType::DATE);
+        default:
+            elog(ERROR, "unsupported oid %d", oid);
+    }
+}
+
+static std::shared_ptr<parquet::schema::GroupNode> SetupSchema(TupleDesc tupdesc) {
+    int     j;
+    parquet::schema::NodeVector fields;
+
+    for (j=0; j < tupdesc->natts; j++)
+    {
+
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, j);
+        auto type_pair = to_parquet_type(attr->atttypid);
+
+        if (type_is_array(attr->atttypid)) {
+            auto element = parquet::schema::PrimitiveNode::Make("item",
+                                             parquet::Repetition::OPTIONAL, type_pair.first, type_pair.second);
+            auto array = parquet::schema::GroupNode::Make("list", parquet::Repetition::REPEATED,  {element});
+
+            fields.push_back(parquet::schema::GroupNode::Make(NameStr(attr->attname), parquet::Repetition::OPTIONAL, {array},
+                                     parquet::ConvertedType::LIST));
+            // fields.push_back(parquet::schema::PrimitiveNode::Make(NameStr(attr->attname), parquet::Repetition::REPEATED,
+            //                          type_pair.first, type_pair.second));
+        } else {
+            fields.push_back(parquet::schema::PrimitiveNode::Make(NameStr(attr->attname), parquet::Repetition::REQUIRED,
+                                     type_pair.first, type_pair.second));
+        }
+        
+    }
+    
+    // Create a GroupNode named 'schema' using the primitive nodes defined above
+    // This GroupNode is the root node of the schema tree
+    return std::static_pointer_cast<parquet::schema::GroupNode>(
+      parquet::schema::GroupNode::Make("schema", parquet::Repetition::REQUIRED, fields));
+}
+
+
+
+static ParquetInsertState *
+create_insert_state(const char *filename,
+                     TupleDesc tupleDesc,
+                     MemoryContext parent_cxt)
+{
+    ParquetInsertState *festate;
+
+    festate = new ParquetInsertState(filename);
+    
+    /* Create mapping between tuple descriptor and parquet columns. */
+    festate->schema = SetupSchema(tupleDesc);
+    
+
+    parquet::schema::PrintSchema(festate->schema.get(), std::cout);
+
+    festate->memcxt = AllocSetContextCreate(parent_cxt,
+                                                  "parquet_fdw tuple data",
+                                                  ALLOCSET_DEFAULT_SIZES);
+
+    //setup schema
+    parquet::WriterProperties::Builder builder;
+    std::shared_ptr<parquet::WriterProperties> props = builder.build();
+    
+    builder.compression(parquet::Compression::SNAPPY);
+
+    festate->stream_writer = std::shared_ptr<parquet::StreamWriter>(new parquet::StreamWriter(\
+        parquet::ParquetFileWriter::Open(festate->parquet_file, festate->schema, props)));
+    festate->stream_writer->SetMaxRowGroupSize(1000);
+
+
+    return festate;
+}
+
+
+
+extern "C" void
+parquetBeginForeignInsert(ModifyTableState *mtstate,
+        ResultRelInfo *rrinfo)
+{
+    elog(INFO,"foreign parquetBeginForeignInsert");   
+    Oid  foreignTableOid = InvalidOid;
+    TupleDesc tupleDescriptor = NULL;
+    Relation relation = rrinfo->ri_RelationDesc;
+    ParquetFdwPlanState     private_fdw;
+    
+    foreignTableOid = RelationGetRelid(relation);
+    //relation = heap_open(foreignTableOid, ShareUpdateExclusiveLock);
+    
+    get_table_options(foreignTableOid, &private_fdw);
+    tupleDescriptor = RelationGetDescr(relation);
+
+    rrinfo->ri_FdwState = (void *)create_insert_state(private_fdw.filename, tupleDescriptor,
+                                                CurrentMemoryContext);
+}
+
+extern "C" void
+parquetBeginForeignModify(ModifyTableState *modifyTableState,
+                         ResultRelInfo *relationInfo, List *fdwPrivate,
+                         int subplanIndex, int executorFlags)
+{
+    elog(INFO,"foreign parquetBeginForeignModify");   
+    /* if Explain with no Analyze, do nothing */
+    if (executorFlags & EXEC_FLAG_EXPLAIN_ONLY)
+    {
+        return;
+    }
+
+    Assert (modifyTableState->operation == CMD_INSERT);
+
+    parquetBeginForeignInsert(modifyTableState, relationInfo);
+}
+
+
+extern "C" TupleTableSlot *
+parquetExecForeignInsert(EState *estate,
+                       ResultRelInfo *rrinfo,
+                       TupleTableSlot *slot,
+                       TupleTableSlot *planSlot)
+{
+    Relation        frel = rrinfo->ri_RelationDesc;
+    TupleDesc       tupdesc = RelationGetDescr(frel);
+    ParquetInsertState *aw_state = (ParquetInsertState*) rrinfo->ri_FdwState;
+    auto schema = aw_state->schema;
+    auto os = aw_state->stream_writer;
+    MemoryContext   oldcxt;
+    int             j;
+
+    slot_getallattrs(slot);
+    oldcxt = MemoryContextSwitchTo(aw_state->memcxt);
+    for (j=0; j < tupdesc->natts; j++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, j);
+        Oid         valtype = attr->atttypid;
+        Datum       datum = slot->tts_values[j];
+        bool        isnull = slot->tts_isnull[j];
+
+        try
+        {
+            if (isnull)
+            {
+                os->SkipColumns(1);
+            }
+            else if (attr->attbyval)
+            {
+               switch (valtype)
+                {
+                    case BOOLOID:
+                    {
+                        bool val = DatumGetBool(datum);
+                        *os << val;
+                        break;
+                    }
+                    case INT2OID:
+                    {
+                        const std::shared_ptr<parquet::schema::Node>& field = schema->field(j);
+                        parquet::ConvertedType::type type = field->converted_type();
+                        if (type == parquet::ConvertedType::INT_16) {
+                            *os << DatumGetInt16(datum);
+                        } else if (type == parquet::ConvertedType::UINT_16) {
+                            *os << DatumGetUInt16(datum);
+                        }
+                        break;
+                    }
+                    case INT4OID:
+                    {
+                        const std::shared_ptr<parquet::schema::Node>& field = schema->field(j);
+                        parquet::ConvertedType::type type = field->converted_type();
+                        if (type == parquet::ConvertedType::INT_32) {
+                            *os << DatumGetInt32(datum);
+                        } else if (type == parquet::ConvertedType::UINT_32) {
+                            *os << DatumGetUInt32(datum);
+                        }
+                        break;
+                    }
+                    case INT8OID:
+                    {
+                        const std::shared_ptr<parquet::schema::Node>& field = schema->field(j);
+                        parquet::ConvertedType::type type = field->converted_type();
+                        if (type == parquet::ConvertedType::INT_64) {
+                            *os << (int64_t)DatumGetInt64(datum);
+                        } else if (type == parquet::ConvertedType::UINT_64) {
+                            *os << (uint64_t)DatumGetUInt64(datum);
+                        }
+                        break;
+                    }
+                    case FLOAT4OID:
+                    {
+                        float val = DatumGetFloat4(datum);
+                        *os << val;
+                        break;
+                    }
+                    case FLOAT8OID:
+                    {
+                        double val = DatumGetFloat8(datum);
+                        *os << val;
+                        break;
+                    }
+                    case TEXTOID:
+                    {
+                        char *s = TextDatumGetCString(datum);
+                        *os << s;
+                        break;
+                    }
+                    case DATEOID:
+                    {
+                        // Timestamp t = date2timestamp_no_overflow(DatumGetDateADT(datum));
+                        // pg_time_t d = timestamptz_to_time_t(t);
+
+                        
+                        break;
+                    }
+                    case TIMESTAMPOID:
+                    {
+                        //pg_time_t d = timestamptz_to_time_t(DatumGetTimestamp(datum));
+
+                        break;
+                    }
+                    default:
+                    {
+                        throw std::runtime_error("unexpected type " +
+                                std::to_string(valtype) + " type ");
+                    }
+                }
+            }
+            else if (attr->attlen == -1)
+            { 
+                
+                size_t     vl_len = VARSIZE_ANY_EXHDR(datum);
+                char   *vl_ptr = VARDATA_ANY(datum);
+                *os << parquet::StreamWriter::FixedStringView{vl_ptr, vl_len};
+            }
+            else
+            {
+                elog(ERROR, "parquet_fdw: unsupported type format");
+            }
+        } 
+        catch(const std::exception& e)
+        {
+            elog(ERROR, "parquet_fdw: parquet insert failed: %s", e.what());
+        }
+    }
+    os->EndRow();
+
+    MemoryContextSwitchTo(oldcxt);
+
+    return slot;
+}
+
+
+extern "C" void
+parquetEndForeignInsert(EState *estate,
+                        ResultRelInfo *rrinfo)
+{
+
+    ParquetInsertState *aw_state = (ParquetInsertState*) rrinfo->ri_FdwState;
+
+    if (aw_state) {
+        aw_state->stream_writer->EndRowGroup();
+        delete aw_state;
+    }
+    aw_state = NULL;
+
 }

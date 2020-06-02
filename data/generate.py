@@ -4,7 +4,7 @@ import pyarrow.parquet as pq
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pyarrow.parquet as pq
+#import pyarrow.parquet as pq
 from datetime import datetime, date
 
 # row group 1
@@ -33,7 +33,8 @@ df2 = pd.DataFrame({'one': [4, 5, 6],
                     'six': [False, False, False]})
 table2 = pa.Table.from_pandas(df2)
 
-with pq.ParquetWriter('example.parquet', table1.schema) as writer:
+print(table1.schema)
+with pq.ParquetWriter('example2.parquet', table1.schema) as writer:
     writer.write_table(table1)
     writer.write_table(table2)
 
