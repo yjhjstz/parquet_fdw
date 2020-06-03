@@ -162,6 +162,20 @@ StreamWriter2& StreamWriter2::WriteVariableLength(const char* data_ptr,
   return *this;
 }
 
+StreamWriter2& StreamWriter2::WriteFloatArray(float* data_ptr, std::size_t num) {
+   auto writer =
+      static_cast<FloatWriter*>(row_group_writer_->column(column_index_++));
+   std::vector<int16_t> definition_levels(num, 3);
+   std::vector<int16_t> repetition_levels(num, 1);
+   repetition_levels[0] = 0;
+                    
+   writer->WriteBatch(num, definition_levels.data(), repetition_levels.data(), data_ptr);
+   if (max_row_group_size_ > 0) {
+    row_group_size_ += writer->EstimatedBufferedValueBytes();
+  }
+  return *this;
+}
+
 StreamWriter2& StreamWriter2::WriteFixedLength(const char* data_ptr, std::size_t data_len) {
   CheckColumn(Type::FIXED_LEN_BYTE_ARRAY, ConvertedType::NONE,
               static_cast<int>(data_len));
@@ -232,6 +246,7 @@ int64_t StreamWriter2::SkipColumns(int num_columns_to_skip) {
   }
   return num_columns_skipped;
 }
+
 
 void StreamWriter2::WriteNullValue(ColumnWriter* writer) {
   switch (writer->type()) {

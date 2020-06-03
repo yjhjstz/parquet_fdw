@@ -164,11 +164,19 @@ parquet_fdw_validator(PG_FUNCTION_ARGS)
 
             if (stat(defGetString(def), &stat_buf) != 0)
             {
-                int e = errno;
+                char     *filename = defGetString(def);
+                //elog(INFO, "touch file %s", filename);
+                File flip = PathNameOpenFile(filename, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
+                if (flip > 0) {
+                    FileClose(flip);
+                } else {
+                    int e = errno;
 
-                ereport(ERROR,
-                        (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                         errmsg("parquet_fdw: %s", strerror(e))));
+                    ereport(ERROR,
+                          (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                           errmsg("parquet_fdw_validator: %s", strerror(e))));
+                }
+                
             }
             filename_provided = true;
         }

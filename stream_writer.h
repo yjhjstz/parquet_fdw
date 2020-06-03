@@ -179,6 +179,8 @@ class StreamWriter2 {
 
   StreamWriter2& WriteVariableLength(const char* data_ptr, std::size_t data_len);
 
+  StreamWriter2& WriteFloatArray(float* data_ptr, std::size_t num);
+
  protected:
   template <typename WriterType, typename T>
   StreamWriter2& Write(const T v) {

@@ -338,7 +338,7 @@ create_parquet_state(const char *filename,
              * XXX If we will ever want to support structs then this should be
              * changed.
              */
-            elog(INFO, "dot path %s .", path[0].c_str());
+            //elog(INFO, "dot path %s .", path[0].c_str());
             if (strcmp(NameStr(TupleDescAttr(tupleDesc, i)->attname),
                        path[0].c_str()) == 0)
             {
@@ -2369,6 +2369,9 @@ parquetBeginForeignModify(ModifyTableState *modifyTableState,
 }
 
 
+#define ARRPTR(x)  ( (float *) ARR_DATA_PTR(x) )
+#define ARRNELEMS(x)  ArrayGetNItems( ARR_NDIM(x), ARR_DIMS(x))
+
 extern "C" TupleTableSlot *
 parquetExecForeignInsert(EState *estate,
                        ResultRelInfo *rrinfo,
@@ -2482,10 +2485,18 @@ parquetExecForeignInsert(EState *estate,
             }
             else if (attr->attlen == -1)
             { 
-                //todo
-                size_t     vl_len = VARSIZE_ANY_EXHDR(datum);
-                char   *vl_ptr = VARDATA_ANY(datum);
-                os->WriteVariableLength(vl_ptr, vl_len);
+                if (type_is_array(attr->atttypid)) {
+                    Assert(attr->atttypid == FLOAT4ARRAYOID);
+                    ArrayType* arr = DatumGetArrayTypeP(datum);
+                    size_t num = ARRNELEMS(arr);
+                    os->WriteFloatArray(ARRPTR(arr), num);
+                } else {
+                    //todo text
+                    size_t     vl_len = VARSIZE_ANY_EXHDR(datum);
+                    char   *vl_ptr = VARDATA_ANY(datum);
+                    os->WriteVariableLength(vl_ptr, vl_len);
+                }
+                
             }
             else
             {
