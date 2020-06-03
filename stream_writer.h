@@ -177,6 +177,8 @@ class StreamWriter2 {
   /// \brief Terminate the current row group and create new one.
   void EndRowGroup();
 
+  StreamWriter2& WriteVariableLength(const char* data_ptr, std::size_t data_len);
+
  protected:
   template <typename WriterType, typename T>
   StreamWriter2& Write(const T v) {
@@ -189,8 +191,6 @@ class StreamWriter2 {
     }
     return *this;
   }
-
-  StreamWriter2& WriteVariableLength(const char* data_ptr, std::size_t data_len);
 
   StreamWriter2& WriteFixedLength(const char* data_ptr, std::size_t data_len);
 

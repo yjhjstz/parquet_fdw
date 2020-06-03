@@ -53,6 +53,8 @@ extern "C"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+#include "storage/lmgr.h"
+
 
 #if PG_VERSION_NUM < 120000
 #include "nodes/relation.h"
@@ -272,11 +274,11 @@ public:
     bool     initialized;
 
     ParquetInsertState(const char *filename)
-        : parquet_file(::arrow::io::FileOutputStream::Open(filename).ValueOrDie()),
-          row_group(-1), row(0), num_rows(0), coordinator(NULL),
+        : row_group(-1), row(0), num_rows(0), coordinator(NULL),
           initialized(false)
     {
-        
+        PARQUET_ASSIGN_OR_THROW(parquet_file,
+            arrow::io::FileOutputStream::Open(filename, false));
     }
 };
 
@@ -2184,7 +2186,7 @@ parquetPlanForeignModify(PlannerInfo *root,
                        Index resultRelation,
                        int subplan_index)
 {
-    elog(INFO,"foreign parquetPlanForeignModify");   
+    //elog(INFO,"foreign parquetPlanForeignModify");   
     if (plan->operation != CMD_INSERT)
         elog(ERROR, "not a supported operation on arrow_fdw foreign tables");
 
@@ -2308,7 +2310,7 @@ extern "C" void
 parquetBeginForeignInsert(ModifyTableState *mtstate,
         ResultRelInfo *rrinfo)
 {
-    elog(INFO,"foreign parquetBeginForeignInsert");   
+    //elog(INFO,"foreign parquetBeginForeignInsert");   
     Oid  foreignTableOid = InvalidOid;
     TupleDesc tupleDescriptor = NULL;
     Relation relation = rrinfo->ri_RelationDesc;
@@ -2326,10 +2328,14 @@ parquetBeginForeignInsert(ModifyTableState *mtstate,
 
 extern "C" void
 parquetBeginForeignModify(ModifyTableState *modifyTableState,
-                         ResultRelInfo *relationInfo, List *fdwPrivate,
+                         ResultRelInfo *rrinfo, List *fdwPrivate,
                          int subplanIndex, int executorFlags)
 {
-    elog(INFO,"foreign parquetBeginForeignModify");   
+    // char        *filename;
+    // File        filp;
+    // Relation        frel = rrinfo->ri_RelationDesc;
+    
+    //elog(INFO,"foreign parquetBeginForeignModify");   
     /* if Explain with no Analyze, do nothing */
     if (executorFlags & EXEC_FLAG_EXPLAIN_ONLY)
     {
@@ -2337,8 +2343,29 @@ parquetBeginForeignModify(ModifyTableState *modifyTableState,
     }
 
     Assert (modifyTableState->operation == CMD_INSERT);
+    #if 0
+    /* Unwrap fdw_private */
+    filename = strVal((Value *) linitial(fdwPrivate));
 
-    parquetBeginForeignInsert(modifyTableState, relationInfo);
+    LockRelation(frel, ShareRowExclusiveLock);
+
+    filp = PathNameOpenFile(filename, O_RDWR | PG_BINARY);
+    if (filp < 0)
+    {
+        if (errno != ENOENT)
+            ereport(ERROR,
+                    (errcode_for_file_access(),
+                     errmsg("could not open file \"%s\": %m", filename)));
+
+        filp = PathNameOpenFile(filename, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
+        if (filp < 0)
+            ereport(ERROR,
+                    (errcode_for_file_access(),
+                     errmsg("could not open file \"%s\": %m", filename)));
+        
+    }
+    #endif
+    parquetBeginForeignInsert(modifyTableState, rrinfo);
 }
 
 
@@ -2458,7 +2485,7 @@ parquetExecForeignInsert(EState *estate,
                 //todo
                 size_t     vl_len = VARSIZE_ANY_EXHDR(datum);
                 char   *vl_ptr = VARDATA_ANY(datum);
-                *os << parquet::StreamWriter2::FixedStringView{vl_ptr, vl_len};
+                os->WriteVariableLength(vl_ptr, vl_len);
             }
             else
             {
@@ -2478,17 +2505,27 @@ parquetExecForeignInsert(EState *estate,
 }
 
 
+
 extern "C" void
 parquetEndForeignInsert(EState *estate,
                         ResultRelInfo *rrinfo)
 {
 
+    //elog(INFO, "parquetEndForeignInsert");
     ParquetInsertState *aw_state = (ParquetInsertState*) rrinfo->ri_FdwState;
 
     if (aw_state) {
-        aw_state->stream_writer->EndRowGroup();
         delete aw_state;
     }
     aw_state = NULL;
 
+}
+
+
+extern "C" void
+parquetEndForeignModify(EState *estate,
+                      ResultRelInfo *rrinfo)
+{
+    //elog(INFO, "parquetEndForeignModify");
+    parquetEndForeignInsert(estate, rrinfo);
 }

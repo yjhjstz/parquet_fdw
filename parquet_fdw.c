@@ -84,6 +84,8 @@ extern void parquetExplainForeignModify(ModifyTableState *mtstate,
               List *fdw_private,
               int subplan_index,
               struct ExplainState *es);
+extern void parquetEndForeignModify(EState *estate,
+            ResultRelInfo *rrinfo);
 
 /* GUC variable */
 extern bool parquet_fdw_use_threads;
@@ -132,7 +134,7 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->BeginForeignModify     = parquetBeginForeignModify;
     fdwroutine->BeginForeignInsert     = parquetBeginForeignInsert;
     fdwroutine->ExecForeignInsert      = parquetExecForeignInsert;
-    //fdwroutine->EndForeignModify       = parquetEndForeignModify;
+    fdwroutine->EndForeignModify       = parquetEndForeignModify;
     fdwroutine->EndForeignInsert       = parquetEndForeignInsert;
     fdwroutine->ExplainForeignModify   = parquetExplainForeignModify;
 
