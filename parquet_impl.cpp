@@ -2298,9 +2298,7 @@ create_insert_state(const char *filename,
 
     festate->stream_writer = std::shared_ptr<parquet::StreamWriter2>(new parquet::StreamWriter2(\
         parquet::ParquetFileWriter::Open(festate->parquet_file, festate->schema, props)));
-    festate->stream_writer->SetMaxRowGroupSize(1000);
-
-
+    
     return festate;
 }
 
