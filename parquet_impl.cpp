@@ -2625,6 +2625,7 @@ parquetAnalyzeForeignTable (Relation relation,
 extern "C" void
 parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
+  #if 0
     List	   *fdw_private;
     List       *rowgroups;
     ListCell   *lc;
@@ -2633,7 +2634,7 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
     initStringInfo(&str);
 
-	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
+	   fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
     rowgroups = (List *) llast(fdw_private);
 
     foreach(lc, rowgroups)
@@ -2654,6 +2655,31 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
     }
 
     ExplainPropertyText("Row groups", str.data, es);
+  #endif
+    List     *fdw_private;
+    char     *sql;
+    char     *relations;
+
+    fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
+
+    /*
+     * Add names of relation handled by the foreign scan when the scan is a
+     * join
+     */
+    if (list_length(fdw_private) > FdwScanPrivateRelations)
+    {
+      relations = strVal(list_nth(fdw_private, FdwScanPrivateRelations));
+      ExplainPropertyText("Relations", relations, es);
+    }
+
+    /*
+     * Add remote query, when VERBOSE option is specified.
+     */
+    if (es->verbose)
+    {
+      sql = strVal(list_nth(fdw_private, FdwScanPrivateSelectSql));
+      ExplainPropertyText("Remote SQL", sql, es);
+    }
 }
 
 /* Parallel query execution */
@@ -3292,6 +3318,412 @@ parquetEndForeignModify(EState *estate,
 {
     //elog(INFO, "parquetEndForeignModify");
     parquetEndForeignInsert(estate, rrinfo);
+}
+
+
+/*
+ * Assess whether the join between inner and outer relations can be pushed down
+ * to the foreign server. As a side effect, save information we obtain in this
+ * function to PgFdwRelationInfo passed in.
+ */
+static bool
+foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
+        RelOptInfo *outerrel, RelOptInfo *innerrel,
+        JoinPathExtraData *extra)
+{
+  ParquetFdwPlanState *fpinfo;
+  ParquetFdwPlanState *fpinfo_o;
+  ParquetFdwPlanState *fpinfo_i;
+  ListCell   *lc;
+  List     *joinclauses;
+
+  /*
+   * We support pushing down INNER, LEFT, RIGHT and FULL OUTER joins.
+   * Constructing queries representing SEMI and ANTI joins is hard, hence
+   * not considered right now.
+   */
+  if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
+    jointype != JOIN_RIGHT && jointype != JOIN_FULL)
+    return false;
+
+  /*
+   * If either of the joining relations is marked as unsafe to pushdown, the
+   * join can not be pushed down.
+   */
+  fpinfo = (ParquetFdwPlanState *) joinrel->fdw_private;
+  fpinfo_o = (ParquetFdwPlanState *) outerrel->fdw_private;
+  fpinfo_i = (ParquetFdwPlanState *) innerrel->fdw_private;
+  if (!fpinfo_o || !fpinfo_o->pushdown_safe ||
+    !fpinfo_i || !fpinfo_i->pushdown_safe)
+    return false;
+
+  /*
+   * If joining relations have local conditions, those conditions are
+   * required to be applied before joining the relations. Hence the join can
+   * not be pushed down.
+   */
+  if (fpinfo_o->local_conds || fpinfo_i->local_conds)
+    return false;
+
+  /*
+   * Merge FDW options.  We might be tempted to do this after we have deemed
+   * the foreign join to be OK.  But we must do this beforehand so that we
+   * know which quals can be evaluated on the foreign server, which might
+   * depend on shippable_extensions.
+   */
+  fpinfo->server = fpinfo_o->server;
+  //merge_fdw_options(fpinfo, fpinfo_o, fpinfo_i);
+
+  /*
+   * Separate restrict list into join quals and pushed-down (other) quals.
+   *
+   * Join quals belonging to an outer join must all be shippable, else we
+   * cannot execute the join remotely.  Add such quals to 'joinclauses'.
+   *
+   * Add other quals to fpinfo->remote_conds if they are shippable, else to
+   * fpinfo->local_conds.  In an inner join it's okay to execute conditions
+   * either locally or remotely; the same is true for pushed-down conditions
+   * at an outer join.
+   *
+   * Note we might return failure after having already scribbled on
+   * fpinfo->remote_conds and fpinfo->local_conds.  That's okay because we
+   * won't consult those lists again if we deem the join unshippable.
+   */
+  joinclauses = NIL;
+  foreach(lc, extra->restrictlist)
+  {
+    RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+    bool    is_remote_clause = is_foreign_expr(root, joinrel,
+                             rinfo->clause);
+
+    if (IS_OUTER_JOIN(jointype) &&
+      !RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids))
+    {
+      if (!is_remote_clause)
+        return false;
+      joinclauses = lappend(joinclauses, rinfo);
+    }
+    else
+    {
+      if (is_remote_clause)
+        fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
+      else
+        fpinfo->local_conds = lappend(fpinfo->local_conds, rinfo);
+    }
+  }
+
+  /*
+   * deparseExplicitTargetList() isn't smart enough to handle anything other
+   * than a Var.  In particular, if there's some PlaceHolderVar that would
+   * need to be evaluated within this join tree (because there's an upper
+   * reference to a quantity that may go to NULL as a result of an outer
+   * join), then we can't try to push the join down because we'll fail when
+   * we get to deparseExplicitTargetList().  However, a PlaceHolderVar that
+   * needs to be evaluated *at the top* of this join tree is OK, because we
+   * can do that locally after fetching the results from the remote side.
+   */
+  foreach(lc, root->placeholder_list)
+  {
+    PlaceHolderInfo *phinfo = (PlaceHolderInfo*)lfirst(lc);
+    Relids    relids;
+
+    /* PlaceHolderInfo refers to parent relids, not child relids. */
+    relids = IS_OTHER_REL(joinrel) ?
+      joinrel->top_parent_relids : joinrel->relids;
+
+    if (bms_is_subset(phinfo->ph_eval_at, relids) &&
+      bms_nonempty_difference(relids, phinfo->ph_eval_at))
+      return false;
+  }
+
+  /* Save the join clauses, for later use. */
+  fpinfo->joinclauses = joinclauses;
+
+  fpinfo->outerrel = outerrel;
+  fpinfo->innerrel = innerrel;
+  fpinfo->jointype = jointype;
+
+  /*
+   * By default, both the input relations are not required to be deparsed as
+   * subqueries, but there might be some relations covered by the input
+   * relations that are required to be deparsed as subqueries, so save the
+   * relids of those relations for later use by the deparser.
+   */
+  fpinfo->make_outerrel_subquery = false;
+  fpinfo->make_innerrel_subquery = false;
+  Assert(bms_is_subset(fpinfo_o->lower_subquery_rels, outerrel->relids));
+  Assert(bms_is_subset(fpinfo_i->lower_subquery_rels, innerrel->relids));
+  fpinfo->lower_subquery_rels = bms_union(fpinfo_o->lower_subquery_rels,
+                      fpinfo_i->lower_subquery_rels);
+
+  /*
+   * Pull the other remote conditions from the joining relations into join
+   * clauses or other remote clauses (remote_conds) of this relation
+   * wherever possible. This avoids building subqueries at every join step.
+   *
+   * For an inner join, clauses from both the relations are added to the
+   * other remote clauses. For LEFT and RIGHT OUTER join, the clauses from
+   * the outer side are added to remote_conds since those can be evaluated
+   * after the join is evaluated. The clauses from inner side are added to
+   * the joinclauses, since they need to be evaluated while constructing the
+   * join.
+   *
+   * For a FULL OUTER JOIN, the other clauses from either relation can not
+   * be added to the joinclauses or remote_conds, since each relation acts
+   * as an outer relation for the other.
+   *
+   * The joining sides can not have local conditions, thus no need to test
+   * shippability of the clauses being pulled up.
+   */
+  switch (jointype)
+  {
+    case JOIN_INNER:
+      fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+                         list_copy(fpinfo_i->remote_conds));
+      fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+                         list_copy(fpinfo_o->remote_conds));
+      break;
+
+    case JOIN_LEFT:
+      fpinfo->joinclauses = list_concat(fpinfo->joinclauses,
+                        list_copy(fpinfo_i->remote_conds));
+      fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+                         list_copy(fpinfo_o->remote_conds));
+      break;
+
+    case JOIN_RIGHT:
+      fpinfo->joinclauses = list_concat(fpinfo->joinclauses,
+                        list_copy(fpinfo_o->remote_conds));
+      fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+                         list_copy(fpinfo_i->remote_conds));
+      break;
+
+    case JOIN_FULL:
+
+      /*
+       * In this case, if any of the input relations has conditions, we
+       * need to deparse that relation as a subquery so that the
+       * conditions can be evaluated before the join.  Remember it in
+       * the fpinfo of this relation so that the deparser can take
+       * appropriate action.  Also, save the relids of base relations
+       * covered by that relation for later use by the deparser.
+       */
+      if (fpinfo_o->remote_conds)
+      {
+        fpinfo->make_outerrel_subquery = true;
+        fpinfo->lower_subquery_rels =
+          bms_add_members(fpinfo->lower_subquery_rels,
+                  outerrel->relids);
+      }
+      if (fpinfo_i->remote_conds)
+      {
+        fpinfo->make_innerrel_subquery = true;
+        fpinfo->lower_subquery_rels =
+          bms_add_members(fpinfo->lower_subquery_rels,
+                  innerrel->relids);
+      }
+      break;
+
+    default:
+      /* Should not happen, we have just checked this above */
+      elog(ERROR, "unsupported join type %d", jointype);
+  }
+
+  /*
+   * For an inner join, all restrictions can be treated alike. Treating the
+   * pushed down conditions as join conditions allows a top level full outer
+   * join to be deparsed without requiring subqueries.
+   */
+  if (jointype == JOIN_INNER)
+  {
+    Assert(!fpinfo->joinclauses);
+    fpinfo->joinclauses = fpinfo->remote_conds;
+    fpinfo->remote_conds = NIL;
+  }
+
+  /* Mark that this join can be pushed down safely */
+  fpinfo->pushdown_safe = true;
+
+  /* Get user mapping */
+  if (fpinfo->use_remote_estimate)
+  {
+    if (fpinfo_o->use_remote_estimate)
+      fpinfo->user = fpinfo_o->user;
+    else
+      fpinfo->user = fpinfo_i->user;
+  }
+  else
+    fpinfo->user = NULL;
+
+  /*
+   * Set # of retrieved rows and cached relation costs to some negative
+   * value, so that we can detect when they are set to some sensible values,
+   * during one (usually the first) of the calls to estimate_path_cost_size.
+   */
+  fpinfo->retrieved_rows = -1;
+  fpinfo->rel_startup_cost = -1;
+  fpinfo->rel_total_cost = -1;
+
+  /*
+   * Set the string describing this join relation to be used in EXPLAIN
+   * output of corresponding ForeignScan.
+   */
+  fpinfo->relation_name = makeStringInfo();
+  appendStringInfo(fpinfo->relation_name, "(%s) %s JOIN (%s)",
+           fpinfo_o->relation_name->data,
+           get_jointype_name(fpinfo->jointype),
+           fpinfo_i->relation_name->data);
+
+  /*
+   * Set the relation index.  This is defined as the position of this
+   * joinrel in the join_rel_list list plus the length of the rtable list.
+   * Note that since this joinrel is at the end of the join_rel_list list
+   * when we are called, we can get the position by list_length.
+   */
+  Assert(fpinfo->relation_index == 0);  /* shouldn't be set yet */
+  fpinfo->relation_index =
+    list_length(root->parse->rtable) + list_length(root->join_rel_list);
+
+  return true;
+}
+
+
+/*
+ * postgresGetForeignJoinPaths
+ *    Add possible ForeignPath to joinrel, if join is safe to push down.
+ */
+extern "C" void
+parquetGetForeignJoinPaths(PlannerInfo *root,
+              RelOptInfo *joinrel,
+              RelOptInfo *outerrel,
+              RelOptInfo *innerrel,
+              JoinType jointype,
+              JoinPathExtraData *extra)
+{
+  ParquetFdwPlanState *fpinfo;
+  ForeignPath *joinpath;
+  double    rows;
+  int     width;
+  Cost    startup_cost;
+  Cost    total_cost;
+  Path     *epq_path;   /* Path to create plan to be executed when
+                 * EvalPlanQual gets triggered. */
+
+  /*
+   * Skip if this join combination has been considered already.
+   */
+  if (joinrel->fdw_private)
+    return;
+
+  /*
+   * This code does not work for joins with lateral references, since those
+   * must have parameterized paths, which we don't generate yet.
+   */
+  if (!bms_is_empty(joinrel->lateral_relids))
+    return;
+
+  /*
+   * Create unfinished PgFdwRelationInfo entry which is used to indicate
+   * that the join relation is already considered, so that we won't waste
+   * time in judging safety of join pushdown and adding the same paths again
+   * if found safe. Once we know that this join can be pushed down, we fill
+   * the entry.
+   */
+  fpinfo = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
+  fpinfo->pushdown_safe = false;
+  joinrel->fdw_private = fpinfo;
+  /* attrs_used is only for base relations. */
+  fpinfo->attrs_used = NULL;
+
+  /*
+   * If there is a possibility that EvalPlanQual will be executed, we need
+   * to be able to reconstruct the row using scans of the base relations.
+   * GetExistingLocalJoinPath will find a suitable path for this purpose in
+   * the path list of the joinrel, if one exists.  We must be careful to
+   * call it before adding any ForeignPath, since the ForeignPath might
+   * dominate the only suitable local path available.  We also do it before
+   * calling foreign_join_ok(), since that function updates fpinfo and marks
+   * it as pushable if the join is found to be pushable.
+   */
+  if (root->parse->commandType == CMD_DELETE ||
+    root->parse->commandType == CMD_UPDATE ||
+    root->rowMarks)
+  {
+    epq_path = GetExistingLocalJoinPath(joinrel);
+    if (!epq_path)
+    {
+      elog(DEBUG3, "could not push down foreign join because a local path suitable for EPQ checks was not found");
+      return;
+    }
+  }
+  else
+    epq_path = NULL;
+
+  if (!foreign_join_ok(root, joinrel, jointype, outerrel, innerrel, extra))
+  {
+    /* Free path required for EPQ if we copied one; we don't need it now */
+    if (epq_path)
+      pfree(epq_path);
+    return;
+  }
+
+  /*
+   * Compute the selectivity and cost of the local_conds, so we don't have
+   * to do it over again for each path. The best we can do for these
+   * conditions is to estimate selectivity on the basis of local statistics.
+   * The local conditions are applied after the join has been computed on
+   * the remote side like quals in WHERE clause, so pass jointype as
+   * JOIN_INNER.
+   */
+  fpinfo->local_conds_sel = clauselist_selectivity(root,
+                           fpinfo->local_conds,
+                           0,
+                           JOIN_INNER,
+                           NULL);
+  cost_qual_eval(&fpinfo->local_conds_cost, fpinfo->local_conds, root);
+
+  /*
+   * If we are going to estimate costs locally, estimate the join clause
+   * selectivity here while we have special join info.
+   */
+  if (!fpinfo->use_remote_estimate)
+    fpinfo->joinclause_sel = clauselist_selectivity(root, fpinfo->joinclauses,
+                            0, fpinfo->jointype,
+                            extra->sjinfo);
+
+  /* Estimate costs for bare join relation */
+  estimate_path_cost_size(root, joinrel, NIL, NIL, NULL,
+              &rows, &width, &startup_cost, &total_cost);
+  /* Now update this information in the joinrel */
+  joinrel->rows = rows;
+  joinrel->reltarget->width = width;
+  fpinfo->rows = rows;
+  fpinfo->width = width;
+  fpinfo->startup_cost = startup_cost;
+  fpinfo->total_cost = total_cost;
+
+  /*
+   * Create a new join path and add it to the joinrel which represents a
+   * join between foreign tables.
+   */
+  joinpath = create_foreign_join_path(root,
+                    joinrel,
+                    NULL, /* default pathtarget */
+                    rows,
+                    startup_cost,
+                    total_cost,
+                    NIL,  /* no pathkeys */
+                    joinrel->lateral_relids,
+                    epq_path,
+                    NIL); /* no fdw_private */
+
+  /* Add generated path into joinrel by add_path(). */
+  add_path(joinrel, (Path *) joinpath);
+
+  /* Consider pathkeys for the join relation */
+ // add_paths_with_pathkeys_for_rel(root, joinrel, epq_path);
+
+  /* XXX Consider parameterized paths for the join relation */
 }
 
 extern "C" void
@@ -4608,3 +5040,4 @@ adjust_foreign_grouping_path_cost(PlannerInfo *root,
     *p_run_cost *= sort_multiplier;
   }
 }
+

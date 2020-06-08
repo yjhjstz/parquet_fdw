@@ -91,6 +91,13 @@ extern void
 parquetGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
                RelOptInfo *input_rel, RelOptInfo *output_rel,
                void *extra);
+extern void
+parquetGetForeignJoinPaths(PlannerInfo *root,
+              RelOptInfo *joinrel,
+              RelOptInfo *outerrel,
+              RelOptInfo *innerrel,
+              JoinType jointype,
+              JoinPathExtraData *extra);
 /* GUC variable */
 extern bool parquet_fdw_use_threads;
 
@@ -142,6 +149,8 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->EndForeignInsert       = parquetEndForeignInsert;
     fdwroutine->ExplainForeignModify   = parquetExplainForeignModify;
 
+    /* Support functions for join push-down */
+    fdwroutine->GetForeignJoinPaths = parquetGetForeignJoinPaths;
     /* Support functions for upper relation push-down */
     fdwroutine->GetForeignUpperPaths = parquetGetForeignUpperPaths;
 
