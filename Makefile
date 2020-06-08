@@ -1,7 +1,9 @@
 MODULE_big = parquet_fdw
-OBJS = parquet_impl.o parquet_fdw.o stream_writer.o
+OBJS = parquet_impl.o parquet_fdw.o stream_writer.o deparse.o option.o shippable.o
 PGFILEDESC = "parquet_fdw - foreign data wrapper for parquet"
 
+PG_CPPFLAGS = -I$(libpq_srcdir)
+SHLIB_LINK_INTERNAL = $(libpq)
 SHLIB_LINK = -lm -lstdc++ -lparquet -larrow
 
 EXTENSION = parquet_fdw

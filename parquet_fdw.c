@@ -87,6 +87,10 @@ extern void parquetExplainForeignModify(ModifyTableState *mtstate,
 extern void parquetEndForeignModify(EState *estate,
             ResultRelInfo *rrinfo);
 
+extern void
+parquetGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
+               RelOptInfo *input_rel, RelOptInfo *output_rel,
+               void *extra);
 /* GUC variable */
 extern bool parquet_fdw_use_threads;
 
@@ -137,6 +141,9 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->EndForeignModify       = parquetEndForeignModify;
     fdwroutine->EndForeignInsert       = parquetEndForeignInsert;
     fdwroutine->ExplainForeignModify   = parquetExplainForeignModify;
+
+    /* Support functions for upper relation push-down */
+    fdwroutine->GetForeignUpperPaths = parquetGetForeignUpperPaths;
 
     PG_RETURN_POINTER(fdwroutine);
 }
