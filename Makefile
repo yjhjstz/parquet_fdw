@@ -4,7 +4,7 @@ PGFILEDESC = "parquet_fdw - foreign data wrapper for parquet"
 
 PG_CPPFLAGS = -I$(libpq_srcdir) -I/opt/annconda3/envs/rapids/include/
 SHLIB_LINK_INTERNAL = $(libpq)
-SHLIB_LINK = -lm -lstdc++ -lparquet -larrow
+SHLIB_LINK = -L/opt/annconda3/envs/rapids/lib/ -lm -lstdc++ -lparquet -larrow
 
 EXTENSION = parquet_fdw
 DATA = parquet_fdw--0.1.sql
