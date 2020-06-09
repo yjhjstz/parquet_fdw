@@ -17,6 +17,7 @@
 #include "lib/stringinfo.h"
 #include "nodes/pathnodes.h"
 #include "utils/relcache.h"
+#include "funcapi.h"
 
 #include "libpq-fe.h"
 

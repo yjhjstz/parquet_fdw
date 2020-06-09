@@ -17,7 +17,7 @@
 #include "parquet/statistics.h"
 
 //#include "parquet/schema.h"
-#include "parquet/stream_reader.h"
+//#include "parquet/stream_reader.h"
 //#include "parquet/stream_writer.h"
 #include "stream_writer.h"
 
@@ -589,6 +589,53 @@ apply_table_options(ParquetFdwPlanState *fpinfo)
             fpinfo->fetch_size = strtol(defGetString(def), NULL, 10);
       } else
           elog(ERROR, "unknown option '%s'", def->defname);
+  }
+}
+
+
+static void
+merge_fdw_options(ParquetFdwPlanState *fpinfo,
+          const ParquetFdwPlanState *fpinfo_o,
+          const ParquetFdwPlanState *fpinfo_i)
+{
+  /* We must always have fpinfo_o. */
+  Assert(fpinfo_o);
+
+  /* fpinfo_i may be NULL, but if present the servers must both match. */
+  Assert(!fpinfo_i ||
+       fpinfo_i->server->serverid == fpinfo_o->server->serverid);
+
+  /*
+   * Copy the server specific FDW options.  (For a join, both relations come
+   * from the same server, so the server options should have the same value
+   * for both relations.)
+   */
+  fpinfo->fdw_startup_cost = fpinfo_o->fdw_startup_cost;
+  fpinfo->fdw_tuple_cost = fpinfo_o->fdw_tuple_cost;
+  fpinfo->shippable_extensions = fpinfo_o->shippable_extensions;
+  fpinfo->use_remote_estimate = fpinfo_o->use_remote_estimate;
+  fpinfo->fetch_size = fpinfo_o->fetch_size;
+
+  /* Merge the table level options from either side of the join. */
+  if (fpinfo_i)
+  {
+    /*
+     * We'll prefer to use remote estimates for this join if any table
+     * from either side of the join is using remote estimates.  This is
+     * most likely going to be preferred since they're already willing to
+     * pay the price of a round trip to get the remote EXPLAIN.  In any
+     * case it's not entirely clear how we might otherwise handle this
+     * best.
+     */
+    fpinfo->use_remote_estimate = fpinfo_o->use_remote_estimate ||
+      fpinfo_i->use_remote_estimate;
+
+    /*
+     * Set fetch size to maximum of the joining sides, since we are
+     * expecting the rows returned by the join to be proportional to the
+     * relation sizes.
+     */
+    fpinfo->fetch_size = Max(fpinfo_o->fetch_size, fpinfo_i->fetch_size);
   }
 }
 
@@ -3404,7 +3451,7 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
    * depend on shippable_extensions.
    */
   fpinfo->server = fpinfo_o->server;
-  //merge_fdw_options(fpinfo, fpinfo_o, fpinfo_i);
+  merge_fdw_options(fpinfo, fpinfo_o, fpinfo_i);
 
   /*
    * Separate restrict list into join quals and pushed-down (other) quals.
@@ -4080,8 +4127,7 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
   fpinfo->table = ifpinfo->table;
   fpinfo->server = ifpinfo->server;
   fpinfo->user = ifpinfo->user;
-  //TODO(yang)
-  //merge_fdw_options(fpinfo, ifpinfo, NULL);
+  merge_fdw_options(fpinfo, ifpinfo, NULL);
 
   /*
    * Assess if it is safe to push down aggregation and grouping.
@@ -4173,7 +4219,7 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
   fpinfo->table = ifpinfo->table;
   fpinfo->server = ifpinfo->server;
   fpinfo->user = ifpinfo->user;
-  //merge_fdw_options(fpinfo, ifpinfo, NULL);
+  merge_fdw_options(fpinfo, ifpinfo, NULL);
 
   /*
    * If the input_rel is a base or join relation, we would already have
@@ -4313,7 +4359,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
   fpinfo->table = ifpinfo->table;
   fpinfo->server = ifpinfo->server;
   fpinfo->user = ifpinfo->user;
-  //merge_fdw_options(fpinfo, ifpinfo, NULL);
+  merge_fdw_options(fpinfo, ifpinfo, NULL);
 
   /*
    * If there is no need to add a LIMIT node, there might be a ForeignPath
