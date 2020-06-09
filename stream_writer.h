@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include "arrow/util/optional.h"
+//#include "arrow/util/optional.h"
 #include "arrow/util/string_view.h"
 #include "parquet/column_writer.h"
 #include "parquet/file_writer.h"
@@ -61,8 +61,8 @@ namespace parquet {
 ///
 class StreamWriter2 {
  public:
-  template <typename T>
-  using optional = ::arrow::util::optional<T>;
+  // template <typename T>
+  // using optional = ::arrow::util::optional<T>;
 
   // N.B. Default constructed objects are not usable.  This
   //      constructor is provided so that the object may be move
@@ -152,14 +152,14 @@ class StreamWriter2 {
   StreamWriter2& operator<<(::arrow::util::string_view v);
 
   /// \brief Output operator for optional fields.
-  template <typename T>
-  StreamWriter2& operator<<(const optional<T>& v) {
-    if (v) {
-      return operator<<(*v);
-    }
-    SkipOptionalColumn();
-    return *this;
-  }
+  // template <typename T>
+  // StreamWriter2& operator<<(const optional<T>& v) {
+  //   if (v) {
+  //     return operator<<(*v);
+  //   }
+  //   SkipOptionalColumn();
+  //   return *this;
+  // }
 
   /// \brief Skip the next N columns of optional data.  If there are
   /// less than N columns remaining then the excess columns are

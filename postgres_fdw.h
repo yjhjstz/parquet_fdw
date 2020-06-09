@@ -235,6 +235,9 @@ extern PGresult *pgfdw_get_result(PGconn *conn, const char *query);
 extern PGresult *pgfdw_exec_query(PGconn *conn, const char *query);
 extern void pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
 							   bool clear, const char *sql);
+extern void create_cursor(ForeignScanState *node);
+extern void fetch_more_data(ForeignScanState *node);
+extern void close_cursor(PGconn *conn, unsigned int cursor_number);
 
 /* in option.c */
 extern int	ExtractConnectionOptions(List *defelems,
@@ -305,5 +308,6 @@ extern const char *get_jointype_name(JoinType jointype);
 /* in shippable.c */
 extern bool is_builtin(Oid objectId);
 extern bool is_shippable(Oid objectId, Oid classId, PgFdwRelationInfo *fpinfo);
+
 
 #endif							/* POSTGRES_FDW_H */

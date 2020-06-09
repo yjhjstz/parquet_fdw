@@ -2456,7 +2456,7 @@ parquetIterateForeignScan(ForeignScanState *node)
      * cursor on the remote side.
      */
     if (!fsstate->cursor_exists) {
-      //create_cursor(node);
+      create_cursor(node);
     }
 
     /*
@@ -2466,7 +2466,7 @@ parquetIterateForeignScan(ForeignScanState *node)
     {
       /* No point in another fetch if we already detected EOF, though. */
       if (!fsstate->eof_reached) {
-        //fetch_more_data(node);
+        fetch_more_data(node);
       }
       /* If we didn't get any tuples, must be end of data. */
       if (fsstate->next_tuple >= fsstate->num_tuples)
@@ -2507,7 +2507,7 @@ parquetEndForeignScan(ForeignScanState *node)
 
     /* Close the cursor if open, to prevent accumulation of cursors */
     if (fsstate->cursor_exists) {
-      //close_cursor(fsstate->conn, fsstate->cursor_number);
+      close_cursor(fsstate->conn, fsstate->cursor_number);
     }
 
     /* Release remote connection */
@@ -5401,4 +5401,174 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
                         sorted_epq_path,
                         NIL));
   }
+}
+
+
+/*
+ * Create cursor for node's query with current parameter values.
+ */
+void create_cursor(ForeignScanState *node)
+{
+  #if 0
+  PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
+  ExprContext *econtext = node->ss.ps.ps_ExprContext;
+  int     numParams = fsstate->numParams;
+  const char **values = fsstate->param_values;
+  PGconn     *conn = fsstate->conn;
+  StringInfoData buf;
+  PGresult   *res;
+
+  /*
+   * Construct array of query parameter values in text format.  We do the
+   * conversions in the short-lived per-tuple context, so as not to cause a
+   * memory leak over repeated scans.
+   */
+  if (numParams > 0)
+  {
+    MemoryContext oldcontext;
+
+    oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+    process_query_params(econtext,
+               fsstate->param_flinfo,
+               fsstate->param_exprs,
+               values);
+
+    MemoryContextSwitchTo(oldcontext);
+  }
+
+  /* Construct the DECLARE CURSOR command */
+  initStringInfo(&buf);
+  appendStringInfo(&buf, "DECLARE c%u CURSOR FOR\n%s",
+           fsstate->cursor_number, fsstate->query);
+
+  /*
+   * Notice that we pass NULL for paramTypes, thus forcing the remote server
+   * to infer types for all parameters.  Since we explicitly cast every
+   * parameter (see deparse.c), the "inference" is trivial and will produce
+   * the desired result.  This allows us to avoid assuming that the remote
+   * server has the same OIDs we do for the parameters' types.
+   */
+  if (!PQsendQueryParams(conn, buf.data, numParams,
+               NULL, values, NULL, NULL, 0))
+    pgfdw_report_error(ERROR, NULL, conn, false, buf.data);
+
+  /*
+   * Get the result, and check for success.
+   *
+   * We don't use a PG_TRY block here, so be careful not to throw error
+   * without releasing the PGresult.
+   */
+  res = pgfdw_get_result(conn, buf.data);
+  if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    pgfdw_report_error(ERROR, res, conn, true, fsstate->query);
+  PQclear(res);
+
+  /* Mark the cursor as created, and show no tuples have been retrieved */
+  fsstate->cursor_exists = true;
+  fsstate->tuples = NULL;
+  fsstate->num_tuples = 0;
+  fsstate->next_tuple = 0;
+  fsstate->fetch_ct_2 = 0;
+  fsstate->eof_reached = false;
+
+  /* Clean up */
+  pfree(buf.data);
+  #endif
+}
+
+/*
+ * Fetch some more rows from the node's cursor.
+ */
+void fetch_more_data(ForeignScanState *node)
+{
+
+  #if 0
+  PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
+  PGresult   *volatile res = NULL;
+  MemoryContext oldcontext;
+
+  /*
+   * We'll store the tuples in the batch_cxt.  First, flush the previous
+   * batch.
+   */
+  fsstate->tuples = NULL;
+  MemoryContextReset(fsstate->batch_cxt);
+  oldcontext = MemoryContextSwitchTo(fsstate->batch_cxt);
+
+  /* PGresult must be released before leaving this function. */
+  PG_TRY();
+  {
+    PGconn     *conn = fsstate->conn;
+    char    sql[64];
+    int     numrows;
+    int     i;
+
+    snprintf(sql, sizeof(sql), "FETCH %d FROM c%u",
+         fsstate->fetch_size, fsstate->cursor_number);
+
+    res = pgfdw_exec_query(conn, sql);
+    /* On error, report the original query, not the FETCH. */
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+      pgfdw_report_error(ERROR, res, conn, false, fsstate->query);
+
+    /* Convert the data into HeapTuples */
+    numrows = PQntuples(res);
+    fsstate->tuples = (HeapTuple *) palloc0(numrows * sizeof(HeapTuple));
+    fsstate->num_tuples = numrows;
+    fsstate->next_tuple = 0;
+
+    for (i = 0; i < numrows; i++)
+    {
+      Assert(IsA(node->ss.ps.plan, ForeignScan));
+
+      fsstate->tuples[i] =
+        make_tuple_from_result_row(res, i,
+                       fsstate->rel,
+                       fsstate->attinmeta,
+                       fsstate->retrieved_attrs,
+                       node,
+                       fsstate->temp_cxt);
+    }
+
+    /* Update fetch_ct_2 */
+    if (fsstate->fetch_ct_2 < 2)
+      fsstate->fetch_ct_2++;
+
+    /* Must be EOF if we didn't get as many tuples as we asked for. */
+    fsstate->eof_reached = (numrows < fsstate->fetch_size);
+
+    PQclear(res);
+    res = NULL;
+  }
+  PG_CATCH();
+  {
+    if (res)
+      PQclear(res);
+    PG_RE_THROW();
+  }
+  PG_END_TRY();
+
+  MemoryContextSwitchTo(oldcontext);
+  #endif
+}
+
+/*
+ * Utility routine to close a cursor.
+ */
+void close_cursor(PGconn *conn, unsigned int cursor_number)
+{
+  char    sql[64];
+  PGresult   *res;
+
+  snprintf(sql, sizeof(sql), "CLOSE c%u", cursor_number);
+
+  /*
+   * We don't use a PG_TRY block here, so be careful not to throw error
+   * without releasing the PGresult.
+   */
+  // res = pgfdw_exec_query(conn, sql);
+  // if (PQresultStatus(res) != PGRES_COMMAND_OK)
+  //   pgfdw_report_error(ERROR, res, conn, true, sql);
+  // PQclear(res);
 }
