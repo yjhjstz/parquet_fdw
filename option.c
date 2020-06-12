@@ -22,7 +22,7 @@
 #include "commands/extension.h"
 #include "utils/builtins.h"
 #include "utils/varlena.h"
-
+#include "executor/spi.h"
 
 /*
  * Describes the valid options for objects that this wrapper uses.

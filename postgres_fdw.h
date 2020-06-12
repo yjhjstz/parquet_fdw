@@ -129,6 +129,13 @@ typedef struct PgFdwScanState
  */
 typedef struct PgFdwRelationInfo
 {
+    char       *filename;
+    Bitmapset  *attrs_sorted;
+
+    bool        use_mmap;
+    bool        use_threads;
+    List       *rowgroups;
+    uint64      ntuples;
 	/*
 	 * True means that the relation can be pushed down. Always true for simple
 	 * foreign scan.

@@ -1,5 +1,5 @@
 MODULE_big = parquet_fdw
-OBJS = parquet_impl.o parquet_fdw.o stream_writer.o deparse.o option.o shippable.o
+OBJS = parquet_impl.o parquet_fdw.o deparse.o option.o shippable.o stream_writer.o
 PGFILEDESC = "parquet_fdw - foreign data wrapper for parquet"
 
 PG_CPPFLAGS = -I$(libpq_srcdir) -I/opt/annconda3/envs/rapids/include/

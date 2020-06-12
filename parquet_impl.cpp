@@ -52,6 +52,7 @@ extern "C"
 #include "optimizer/tlist.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
+#include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
@@ -404,8 +405,9 @@ public:
         : row_group(-1), row(0), num_rows(0), coordinator(NULL),
           initialized(false)
     {
-        PARQUET_ASSIGN_OR_THROW(parquet_file,
-            arrow::io::FileOutputStream::Open(filename, false));
+        // PARQUET_ASSIGN_OR_THROW(parquet_file,
+        //     arrow::io::FileOutputStream::Open(filename, false));
+        arrow::io::FileOutputStream::Open(filename, false, &parquet_file);
     }
 };
 
@@ -530,7 +532,7 @@ parse_attributes_list(char *start, Oid relid)
 
 
 static void
-apply_server_options(ParquetFdwPlanState *fpinfo)
+apply_server_options(PgFdwRelationInfo *fpinfo)
 {
   ListCell   *lc;
 
@@ -558,7 +560,7 @@ apply_server_options(ParquetFdwPlanState *fpinfo)
  * New options might also require tweaking merge_fdw_options().
  */
 static void
-apply_table_options(ParquetFdwPlanState *fpinfo)
+apply_table_options(PgFdwRelationInfo *fpinfo)
 {
   ListCell   *lc;
 
@@ -594,9 +596,9 @@ apply_table_options(ParquetFdwPlanState *fpinfo)
 
 
 static void
-merge_fdw_options(ParquetFdwPlanState *fpinfo,
-          const ParquetFdwPlanState *fpinfo_o,
-          const ParquetFdwPlanState *fpinfo_i)
+merge_fdw_options(PgFdwRelationInfo *fpinfo,
+          const PgFdwRelationInfo *fpinfo_o,
+          const PgFdwRelationInfo *fpinfo_i)
 {
   /* We must always have fpinfo_o. */
   Assert(fpinfo_o);
@@ -692,17 +694,18 @@ parquetGetForeignRelSize(PlannerInfo *root,
     // get_table_options(foreigntableid, fdw_private);
     // baserel->fdw_private = fdw_private;
 
-    ParquetFdwPlanState *fpinfo;
+    PgFdwRelationInfo *fpinfo;
     ListCell   *lc;
-
+    RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
     const char *ns;
     const char *relname;
+    const char *refname;
 
     /*
      * We use PgFdwRelationInfo to pass various information to subsequent
      * functions.
      */
-    fpinfo = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
+    fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(ParquetFdwPlanState));
     baserel->fdw_private = (void *) fpinfo;
 
     /* Base foreign tables need to be pushed down always. */
@@ -731,8 +734,14 @@ parquetGetForeignRelSize(PlannerInfo *root,
      * should match what ExecCheckRTEPerms() does.  If we fail due to lack of
      * permissions, the query would have failed at runtime anyway.
      */
-    
-    fpinfo->user = NULL;
+    if (fpinfo->use_remote_estimate)
+    {
+      Oid     userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+
+      fpinfo->user = GetUserMapping(userid, fpinfo->server->serverid);
+    }
+    else
+      fpinfo->user = NULL;
 
     /*
      * Identify which baserestrictinfo clauses can be sent to the remote
@@ -841,9 +850,14 @@ parquetGetForeignRelSize(PlannerInfo *root,
     fpinfo->relation_name = makeStringInfo();
     ns = get_namespace_name(get_rel_namespace(foreigntableid));
     relname = get_rel_name(foreigntableid);
+    refname = rte->eref->aliasname;
     appendStringInfo(fpinfo->relation_name, "%s.%s",
              quote_identifier(ns),
              quote_identifier(relname));
+    if (*refname && strcmp(refname, relname) != 0)
+      appendStringInfo(fpinfo->relation_name, " %s",
+               quote_identifier(rte->eref->aliasname));
+
 
     /* No outer and inner relations. */
     fpinfo->make_outerrel_subquery = false;
@@ -1391,10 +1405,10 @@ parquetGetForeignPaths(PlannerInfo *root,
         add_partial_path(baserel, parallel_path);
     }
   #endif
-    ParquetFdwPlanState *fpinfo = (ParquetFdwPlanState *) baserel->fdw_private;
+    PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
     ForeignPath *path;
-    List     *ppi_list;
-    ListCell   *lc;
+    //List     *ppi_list;
+    //ListCell   *lc;
 
     /*
      * Create simplest ForeignScan path node and add it to baserel.  This path
@@ -1431,7 +1445,7 @@ parquetGetForeignPlan(PlannerInfo *root,
                       List *scan_clauses,
                       Plan *outer_plan)
 {
-    ParquetFdwPlanState *fpinfo = (ParquetFdwPlanState *) foreignrel->fdw_private;
+    PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) foreignrel->fdw_private;
 	  Index    scan_relid;
     List     *fdw_private;
     List     *remote_exprs = NIL;
@@ -1644,8 +1658,8 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 {
   #if 0
     ParquetFdwExecutionState *festate; 
-	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
-	EState         *estate = node->ss.ps.state;
+	  ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
+	  EState         *estate = node->ss.ps.state;
     List           *fdw_private = plan->fdw_private;
     List           *attrs_used_list;
     List           *rowgroups_list;
@@ -1692,10 +1706,10 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
     EState     *estate = node->ss.ps.state;
     PgFdwScanState *fsstate;
-    //RangeTblEntry *rte;
-    //Oid     userid;
-    //ForeignTable *table;
-    //UserMapping *user;
+    RangeTblEntry *rte;
+    Oid     userid;
+    ForeignTable *table;
+    UserMapping *user;
     int     rtindex;
     int     numParams;
 
@@ -1721,12 +1735,12 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
       rtindex = fsplan->scan.scanrelid;
     else
       rtindex = bms_next_member(fsplan->fs_relids, -1);
-    //rte = exec_rt_fetch(rtindex, estate);
-    //userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+    rte = exec_rt_fetch(rtindex, estate);
+    userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
 
     /* Get info about foreign table. */
-    //table = GetForeignTable(rte->relid);
-    //user = GetUserMapping(userid, table->serverid);
+    table = GetForeignTable(rte->relid);
+    user = GetUserMapping(userid, table->serverid);
 
     /*
      * Get connection to the foreign server.  Connection manager will
@@ -3189,11 +3203,7 @@ parquetBeginForeignModify(ModifyTableState *modifyTableState,
                          ResultRelInfo *rrinfo, List *fdwPrivate,
                          int subplanIndex, int executorFlags)
 {
-    // char        *filename;
-    // File        filp;
-    // Relation        frel = rrinfo->ri_RelationDesc;
-    
-    //elog(INFO,"foreign parquetBeginForeignModify");   
+   //elog(INFO,"foreign parquetBeginForeignModify");   
     /* if Explain with no Analyze, do nothing */
     if (executorFlags & EXEC_FLAG_EXPLAIN_ONLY)
     {
@@ -3201,28 +3211,7 @@ parquetBeginForeignModify(ModifyTableState *modifyTableState,
     }
 
     Assert (modifyTableState->operation == CMD_INSERT);
-    #if 0
-    /* Unwrap fdw_private */
-    filename = strVal((Value *) linitial(fdwPrivate));
-
-    LockRelation(frel, ShareRowExclusiveLock);
-
-    filp = PathNameOpenFile(filename, O_RDWR | PG_BINARY);
-    if (filp < 0)
-    {
-        if (errno != ENOENT)
-            ereport(ERROR,
-                    (errcode_for_file_access(),
-                     errmsg("could not open file \"%s\": %m", filename)));
-
-        filp = PathNameOpenFile(filename, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
-        if (filp < 0)
-            ereport(ERROR,
-                    (errcode_for_file_access(),
-                     errmsg("could not open file \"%s\": %m", filename)));
-        
-    }
-    #endif
+    
     parquetBeginForeignInsert(modifyTableState, rrinfo);
 }
 
@@ -3383,10 +3372,11 @@ parquetEndForeignInsert(EState *estate,
     //elog(INFO, "parquetEndForeignInsert");
     ParquetInsertState *aw_state = (ParquetInsertState*) rrinfo->ri_FdwState;
 
-    if (aw_state) {
-        delete aw_state;
-    }
-    aw_state = NULL;
+    // if (aw_state) {
+    //     delete aw_state;
+    // }
+    // aw_state = NULL;
+    aw_state->stream_writer.reset();
 
 }
 
@@ -3410,9 +3400,9 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
         RelOptInfo *outerrel, RelOptInfo *innerrel,
         JoinPathExtraData *extra)
 {
-  ParquetFdwPlanState *fpinfo;
-  ParquetFdwPlanState *fpinfo_o;
-  ParquetFdwPlanState *fpinfo_i;
+  PgFdwRelationInfo *fpinfo;
+  PgFdwRelationInfo *fpinfo_o;
+  PgFdwRelationInfo *fpinfo_i;
   ListCell   *lc;
   List     *joinclauses;
 
@@ -3429,9 +3419,9 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
    * If either of the joining relations is marked as unsafe to pushdown, the
    * join can not be pushed down.
    */
-  fpinfo = (ParquetFdwPlanState *) joinrel->fdw_private;
-  fpinfo_o = (ParquetFdwPlanState *) outerrel->fdw_private;
-  fpinfo_i = (ParquetFdwPlanState *) innerrel->fdw_private;
+  fpinfo = (PgFdwRelationInfo *) joinrel->fdw_private;
+  fpinfo_o = (PgFdwRelationInfo *) outerrel->fdw_private;
+  fpinfo_i = (PgFdwRelationInfo *) innerrel->fdw_private;
   if (!fpinfo_o || !fpinfo_o->pushdown_safe ||
     !fpinfo_i || !fpinfo_i->pushdown_safe)
     return false;
@@ -3679,7 +3669,7 @@ parquetGetForeignJoinPaths(PlannerInfo *root,
               JoinType jointype,
               JoinPathExtraData *extra)
 {
-  ParquetFdwPlanState *fpinfo;
+  PgFdwRelationInfo *fpinfo;
   ForeignPath *joinpath;
   double    rows;
   int     width;
@@ -3708,7 +3698,7 @@ parquetGetForeignJoinPaths(PlannerInfo *root,
    * if found safe. Once we know that this join can be pushed down, we fill
    * the entry.
    */
-  fpinfo = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
+  fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
   fpinfo->pushdown_safe = false;
   joinrel->fdw_private = fpinfo;
   /* attrs_used is only for base relations. */
@@ -3800,7 +3790,7 @@ parquetGetForeignJoinPaths(PlannerInfo *root,
   add_path(joinrel, (Path *) joinpath);
 
   /* Consider pathkeys for the join relation */
- // add_paths_with_pathkeys_for_rel(root, joinrel, epq_path);
+  add_paths_with_pathkeys_for_rel(root, joinrel, epq_path);
 
   /* XXX Consider parameterized paths for the join relation */
 }
@@ -3810,14 +3800,14 @@ parquetGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
                RelOptInfo *input_rel, RelOptInfo *output_rel,
                void *extra)
 {
-    ParquetFdwPlanState *fpinfo;
+    PgFdwRelationInfo *fpinfo;
 
     /*
      * If input rel is not safe to pushdown, then simply return as we cannot
      * perform any post-join operations on the foreign server.
      */
     if (!input_rel->fdw_private ||
-      !((ParquetFdwPlanState *) input_rel->fdw_private)->pushdown_safe)
+      !((PgFdwRelationInfo *) input_rel->fdw_private)->pushdown_safe)
       return;
 
     /* Ignore stages we don't support; and skip any duplicate calls. */
@@ -3827,7 +3817,7 @@ parquetGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
       output_rel->fdw_private)
       return;
 
-    fpinfo = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
+    fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
     fpinfo->pushdown_safe = false;
     fpinfo->stage = stage;
     output_rel->fdw_private = fpinfo;
@@ -3862,9 +3852,9 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
           Node *havingQual)
 {
   Query    *query = root->parse;
-  ParquetFdwPlanState *fpinfo = (ParquetFdwPlanState *) grouped_rel->fdw_private;
+  PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) grouped_rel->fdw_private;
   PathTarget *grouping_target = grouped_rel->reltarget;
-  ParquetFdwPlanState *ofpinfo;
+  PgFdwRelationInfo *ofpinfo;
   ListCell   *lc;
   int     i;
   List     *tlist = NIL;
@@ -3874,7 +3864,7 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
     return false;
 
   /* Get the fpinfo of the underlying scan relation. */
-  ofpinfo = (ParquetFdwPlanState *) fpinfo->outerrel->fdw_private;
+  ofpinfo = (PgFdwRelationInfo *) fpinfo->outerrel->fdw_private;
 
   /*
    * If underlying scan relation has any local conditions, those conditions
@@ -4101,8 +4091,8 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
                GroupPathExtraData *extra)
 {
   Query    *parse = root->parse;
-  ParquetFdwPlanState *ifpinfo = (ParquetFdwPlanState *)input_rel->fdw_private;
-  ParquetFdwPlanState *fpinfo = (ParquetFdwPlanState *)grouped_rel->fdw_private;
+  PgFdwRelationInfo *ifpinfo = (PgFdwRelationInfo *)input_rel->fdw_private;
+  PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *)grouped_rel->fdw_private;
   ForeignPath *grouppath;
   double    rows;
   int     width;
@@ -4191,8 +4181,8 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
               RelOptInfo *ordered_rel)
 {
   Query    *parse = root->parse;
-  ParquetFdwPlanState *ifpinfo = (ParquetFdwPlanState *)input_rel->fdw_private;
-  ParquetFdwPlanState *fpinfo = (ParquetFdwPlanState *)ordered_rel->fdw_private;
+  PgFdwRelationInfo *ifpinfo = (PgFdwRelationInfo *)input_rel->fdw_private;
+  PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *)ordered_rel->fdw_private;
   PgFdwPathExtraData *fpextra;
   double    rows;
   int     width;
@@ -4319,8 +4309,8 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
             FinalPathExtraData *extra)
 {
   Query    *parse = root->parse;
-  ParquetFdwPlanState *ifpinfo = (ParquetFdwPlanState *) input_rel->fdw_private;
-  ParquetFdwPlanState *fpinfo = (ParquetFdwPlanState *) final_rel->fdw_private;
+  PgFdwRelationInfo *ifpinfo = (PgFdwRelationInfo *) input_rel->fdw_private;
+  PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) final_rel->fdw_private;
   bool    has_final_sort = false;
   List     *pathkeys = NIL;
   PgFdwPathExtraData *fpextra;
@@ -4445,7 +4435,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
     ifpinfo->stage == UPPERREL_ORDERED)
   {
     input_rel = ifpinfo->outerrel;
-    ifpinfo = (ParquetFdwPlanState *) input_rel->fdw_private;
+    ifpinfo = (PgFdwRelationInfo *) input_rel->fdw_private;
     has_final_sort = true;
     pathkeys = root->sort_pathkeys;
   }
@@ -4565,7 +4555,7 @@ estimate_path_cost_size(PlannerInfo *root,
             double *p_rows, int *p_width,
             Cost *p_startup_cost, Cost *p_total_cost)
 {
-  ParquetFdwPlanState *fpinfo = (ParquetFdwPlanState *) foreignrel->fdw_private;
+  PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) foreignrel->fdw_private;
   double    rows;
   double    retrieved_rows;
   int     width;
@@ -5239,7 +5229,7 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 {
   List     *useful_pathkeys_list = NIL;
   List     *useful_eclass_list;
-  ParquetFdwPlanState *fpinfo = (ParquetFdwPlanState *) rel->fdw_private;
+  PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) rel->fdw_private;
   EquivalenceClass *query_ec = NULL;
   ListCell   *lc;
 

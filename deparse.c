@@ -1412,7 +1412,7 @@ deparseLockingClause(deparse_expr_cxt *context)
 static void
 appendConditions(List *exprs, deparse_expr_cxt *context)
 {
-	int			nestlevel;
+	//int			nestlevel;
 	ListCell   *lc;
 	bool		is_first = true;
 	StringInfo	buf = context->buf;
@@ -1907,7 +1907,7 @@ deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 					   List **retrieved_attrs)
 {
 	deparse_expr_cxt context;
-	int			nestlevel;
+	//int			nestlevel;
 	bool		first;
 	ListCell   *lc;
 	RangeTblEntry *rte = planner_rt_fetch(rtindex, root);
@@ -2413,7 +2413,7 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 			deparseVar((Var *) node, context);
 			break;
 		case T_Const:
-			deparseConst((Const *) node, context, 0);
+			deparseConst((Const *) node, context, -1);
 			break;
 		case T_Param:
 			deparseParam((Param *) node, context);
@@ -2836,21 +2836,16 @@ deparseOperatorName(StringInfo buf, Form_pg_operator opform)
 	/* opname is not a SQL identifier, so we should not quote it. */
 	opname = NameStr(opform->oprname);
 
-	/* Print schema name only if it's not pg_catalog */
-	if (opform->oprnamespace != PG_CATALOG_NAMESPACE)
-	{
-		const char *opnspname;
-
-		opnspname = get_namespace_name(opform->oprnamespace);
-		/* Print fully qualified operator name. */
-		appendStringInfo(buf, "OPERATOR(%s.%s)",
-						 quote_identifier(opnspname), opname);
-	}
+	if (strcmp(opname, "~~") == 0)
+		appendStringInfoString(buf, "LIKE");
+	else if (strcmp(opname, "~~*") == 0)
+		appendStringInfoString(buf, "LIKE");
+	else if (strcmp(opname, "!~~") == 0)
+		appendStringInfoString(buf, "NOT LIKE");
+	else if (strcmp(opname, "!~~*") == 0)
+		appendStringInfoString(buf, "NOT LIKE");
 	else
-	{
-		/* Just print operator name. */
 		appendStringInfoString(buf, opname);
-	}
 }
 
 /*
@@ -3165,10 +3160,10 @@ appendAggOrderBy(List *orderList, List *targetList, deparse_expr_cxt *context)
 			ReleaseSysCache(opertup);
 		}
 
-		if (srt->nulls_first)
-			appendStringInfoString(buf, " NULLS FIRST");
-		else
-			appendStringInfoString(buf, " NULLS LAST");
+		// if (srt->nulls_first)
+		// 	appendStringInfoString(buf, " NULLS FIRST");
+		// else
+		// 	appendStringInfoString(buf, " NULLS LAST");
 	}
 }
 
@@ -3261,7 +3256,7 @@ appendOrderByClause(List *pathkeys, bool has_final_sort,
 					deparse_expr_cxt *context)
 {
 	ListCell   *lcell;
-	int			nestlevel;
+	//int			nestlevel;
 	char	   *delim = " ";
 	RelOptInfo *baserel = context->scanrel;
 	StringInfo	buf = context->buf;
@@ -3297,10 +3292,10 @@ appendOrderByClause(List *pathkeys, bool has_final_sort,
 		else
 			appendStringInfoString(buf, " DESC");
 
-		if (pathkey->pk_nulls_first)
-			appendStringInfoString(buf, " NULLS FIRST");
-		else
-			appendStringInfoString(buf, " NULLS LAST");
+		// if (pathkey->pk_nulls_first)
+		// 	appendStringInfoString(buf, " NULLS FIRST");
+		// else
+		// 	appendStringInfoString(buf, " NULLS LAST");
 
 		delim = ", ";
 	}
@@ -3397,7 +3392,7 @@ deparseSortGroupClause(Index ref, List *tlist, bool force_colno,
 		 * BY 2", which will be misconstrued as a column position rather than
 		 * a constant.
 		 */
-		deparseConst((Const *) expr, context, 1);
+		deparseConst((Const *) expr, context, -1);
 	}
 	else if (!expr || IsA(expr, Var))
 		deparseExpr(expr, context);
